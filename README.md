@@ -26,3 +26,7 @@ Allow External Access:
 `sudo iptables -I INPUT -s 8080 -j ACCEPT`
 `kubectl -n awx port-forward --address 0.0.0.0 services/awx-demo-service 8080:80`
 
+Delete the deployment (operator name comes from the AWX resource metadata):
+`kubectl -n awx delete awx <operator name>`
+`kubectl delete namespaces awx`
+
