@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import argparse
 import base64
+from datetime import datetime
 import json
 import os
 import shutil
@@ -9,17 +11,18 @@ import sys
 import tarfile
 
 class Deployment:
-    def __init__(self, deployment):
-        self.deployment = deployment
-        self.db_configuration = json.loads(self.run_k8s("get", "secret", f"{self.deployment}-postgres-configuration", "-o", "jsonpath={.data}"))
+    def __init__(self, namespace):
+        self.namespace = namespace
+        self.operator_name = self.run_k8s("get", "awx", "-o", "jsonpath={.items[0].metadata.name}")
+        self.db_pod = self.run_k8s("get", "pod", "--selector=app.kubernetes.io/component=database", "-o", "jsonpath={.items[0].metadata.name}")
+        self.db_configuration = json.loads(self.run_k8s("get", "secret", f"{self.operator_name}-postgres-configuration", "-o", "jsonpath={.data}"))
         self.decode(self.db_configuration, *self.db_configuration.keys())
 
-    @staticmethod
-    def run_k8s(*cmd, stdin=None, stdout=None, stderr=None, decode=True):
+    def run_k8s(self, *cmd, stdin=None, stdout=None, stderr=None, decode=True):
         command = [
             "kubectl",
             "-n",
-            "awx",
+            self.namespace,
             *cmd
         ]
         result = subprocess.run(command, capture_output=(stdout is None), input=stdin, stdout=stdout, stderr=stderr)
@@ -31,8 +34,7 @@ class Deployment:
                 return result.stdout.decode()
             return result.stdout
 
-    @staticmethod
-    def exec_k8s(pod, container, *cmd, stdin=None, stdout=None, stderr=None, decode=True):
+    def exec_k8s(self, pod, container, *cmd, stdin=None, stdout=None, stderr=None, decode=True):
         exec_cmd = ["exec"]
         if stdin:
             exec_cmd.append("-i")
@@ -42,11 +44,11 @@ class Deployment:
             "--",
             *cmd,
         ])
-        return Deployment.run_k8s(*exec_cmd, stdin=stdin, stdout=stdout, stderr=stderr, decode=decode)
+        return self.run_k8s(*exec_cmd, stdin=stdin, stdout=stdout, stderr=stderr, decode=decode)
 
     def exec_db(self, cmd, *args, stdin=None, stdout=None, stderr=None, decode=True):
         return self.exec_k8s(
-            f"{self.deployment}-postgres-13-0",
+            self.db_pod,
             "postgres",
             "env", f"PGPASSWORD={self.db_configuration['password']}",
             cmd,
@@ -77,12 +79,11 @@ class Deployment:
 
         output = self.run_k8s("get", "secrets", "-o", "jsonpath={.items[*].metadata.name}")
         for secret_name in output.split():
-            if secret_name == f"{self.deployment}-postgres-configuration":
+            if secret_name.endswith("postgres-configuration"):
                 continue
 
             with open(os.path.join(name, f"{secret_name}_secret.json"), "w") as secret_file:
-                secret = self.run_k8s("get", "secret", secret_name, "-o", "json")
-                print(secret, file=secret_file)
+                secret = self.run_k8s("get", "secret", secret_name, "-o", "json", stdout=secret_file)
 
         with tarfile.open(f"{name}.tar", "w") as tar:
             tar.add(name)
@@ -90,17 +91,10 @@ class Deployment:
         shutil.rmtree(name)
 
     def recreate_db(self, backup):
-        # disconnect any clients
-        #self.exec_db(
-        #    "psql",
-        #    "-d", "postgres",
-        #    "-c", f"select pg_terminate_backend(pid) from pg_stat_activity where datname='{self.db_configuration['database']}'"
-        #)
-
-        # drop the database
+        # drop the existing database
         self.exec_db(
             "dropdb",
-            "--force",
+            "--force",  # force will disconnect existing clients
             "--if-exists",
             self.db_configuration['database'],
         )
@@ -113,11 +107,6 @@ class Deployment:
         )
 
         # load the backup file
-        #self.exec_db(
-        #    "psql",
-        #    "-d", self.db_configuration['database'],
-        #    stdin=backup
-        #)
         self.exec_db(
             "pg_restore",
             "-d", self.db_configuration['database'],
@@ -129,11 +118,11 @@ class Deployment:
         )
 
     def recreate_secret(self, old_secret):
-        old_deployment = old_secret["metadata"].get("labels", {}).get("app.kubernetes.io/part-of", None)
-        if old_deployment:
+        old_operator_name = old_secret["metadata"].get("labels", {}).get("app.kubernetes.io/part-of", None)
+        if old_operator_name:
             old_secret_name = old_secret["metadata"]["name"]
-            new_secret_name = old_secret_name.removeprefix(old_deployment)
-            new_secret_name = f"{self.deployment}{new_secret_name}"
+            new_secret_name = old_secret_name.removeprefix(old_operator_name)
+            new_secret_name = f"{self.operator_name}{new_secret_name}"
             current_secret = json.loads(self.run_k8s("get", "secret", new_secret_name, "-o", "json"))
             current_secret["data"] = old_secret["data"]
             self.run_k8s("apply", "-f", "-", stdin=json.dumps(current_secret).encode())
@@ -155,19 +144,33 @@ class Deployment:
                     print(f"Unknown backup file {member.name}", file=sys.stderr)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(f"Usage: <{sys.argv[0]}> [backup|restore] [backup name] <deployment name>", file=sys.stderr)
-        sys.exit(1)
+    default_name = datetime.now().strftime("%Y-%m-%d")
+    parser = argparse.ArgumentParser(
+        prog=os.path.basename(sys.argv[0]),
+        description="Utility to help backup and restore AWX instances deployed using the awx-operator.",
+    )
+    parser.add_argument(
+        "command",
+        choices=["backup", "restore"],
+        help="The action to take",
+    )
+    parser.add_argument(
+        "backup_name",
+        nargs="?",
+        default=default_name,
+        help=f"The name of the backup, will be used to construct the backup filename <backup_name>.tar. Defaults to {default_name}",
+    )
+    parser.add_argument(
+        "-n",
+        "--namespace",
+        default="awx",
+        help="The namespace that was used when creating AWX using awx-operator",
+    )
+    args = parser.parse_args()
 
-    deployment_name = "awx-demo"
-    if len(sys.argv) == 4:
-        deployment_name = sys.argv[3]
-    deployment = Deployment(deployment_name)
-    if sys.argv[1] == "backup":
-        deployment.backup(sys.argv[2])
-    elif sys.argv[1] == "restore":
-        deployment.restore(sys.argv[2])
-    else:
-        print(f"Unknown command {sys.argv[1]}", file=sys.stderr)
-        sys.exit(1)
+    deployment = Deployment(args.namespace)
+    if args.command == "backup":
+        deployment.backup(args.backup_name)
+    elif args.command == "restore":
+        deployment.restore(args.backup_name)
 
